@@ -8,11 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/http/httptrace"
-	"runtime"
 	"sort"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/anchore/grype/grype/pkg"
@@ -25,17 +21,41 @@ type MavenSearcher interface {
 }
 
 type mavenSearch struct {
-	client     *http.Client
-	baseURL    string
-	limiter    *rate.Limiter
-	mu         sync.RWMutex
-	lastError  time.Time
-	errorCount int
+	client  *http.Client
+	baseURL string
+	limiter *rate.Limiter
+	//mu      sync.RWMutex
+	//lastError  time.Time
+	//errorCount int
 }
 
 func NewMavenSearch(client *http.Client, baseURL string) *mavenSearch {
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     30 * time.Second,
+				DisableCompression:  true,
+				ForceAttemptHTTP2:   false,
+				//DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				//	start := time.Now()
+				//	d := &net.Dialer{
+				//		Timeout:   10 * time.Second,
+				//		KeepAlive: 15 * time.Second,
+				//	}
+				//	conn, err := d.DialContext(ctx, network, addr)
+				//	log.Printf("Dial: addr=%s localAddr=%v remoteAddr=%v took=%v err=%v",
+				//		addr,
+				//		conn.LocalAddr(),
+				//		conn.RemoteAddr(),
+				//		time.Since(start),
+				//		err)
+				//	return conn, err
+				//},
+			},
+		}
 	}
 	return &mavenSearch{
 		client:  client,
@@ -60,80 +80,46 @@ type mavenAPIResponse struct {
 	} `json:"response"`
 }
 
-func (ms *mavenSearch) adjustRateLimit() {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-
-	if time.Since(ms.lastError) > 5*time.Minute {
-		ms.errorCount = 0
-		ms.limiter.SetLimit(rate.Every(1 * time.Second))
-		return
-	}
-
-	newDelay := time.Duration(ms.errorCount+1) * 2 * time.Second
-	ms.limiter.SetLimit(rate.Every(newDelay))
-}
-
-func (ms *mavenSearch) recordError() {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-	ms.lastError = time.Now()
-	ms.errorCount++
-}
+//
+//func (ms *mavenSearch) adjustRateLimit() {
+//	ms.mu.Lock()
+//	defer ms.mu.Unlock()
+//
+//	if time.Since(ms.lastError) > 5*time.Minute {
+//		ms.errorCount = 0
+//		ms.limiter.SetLimit(rate.Every(1 * time.Second))
+//		return
+//	}
+//
+//	newDelay := time.Duration(ms.errorCount+1) * 2 * time.Second
+//	ms.limiter.SetLimit(rate.Every(newDelay))
+//}
+//
+//func (ms *mavenSearch) recordError() {
+//	ms.mu.Lock()
+//	defer ms.mu.Unlock()
+//	ms.lastError = time.Now()
+//	ms.errorCount++
+//}
 
 func (ms *mavenSearch) GetMavenPackageBySha(ctx context.Context, sha1 string) (*pkg.Package, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	maxRetries := 5
-	baseDelay := 500 * time.Millisecond
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		if err := ms.limiter.Wait(ctx); err != nil {
-			return nil, fmt.Errorf("rate limiter error: %w", err)
-		}
-
-		pkg, err := ms.tryGetMavenPackage(ctx, sha1)
-		if err == nil {
-			return pkg, nil
-		}
-
-		if strings.Contains(err.Error(), "status 403") {
-			delay := baseDelay * time.Duration(attempt+1) // Linear instead of exponential
-			time.Sleep(delay)
-			continue
-		}
-
-		return nil, err
+	if err := ms.limiter.Wait(ctx); err != nil {
+		return nil, fmt.Errorf("rate limiter error: %w", err)
 	}
-	return nil, fmt.Errorf("max retries exceeded for sha1: %s", sha1)
+
+	return ms.tryGetMavenPackage(ctx, sha1)
+
 }
 
 func (ms *mavenSearch) tryGetMavenPackage(ctx context.Context, sha1 string) (*pkg.Package, error) {
-	start := time.Now()
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ms.baseURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize HTTP client: %w", err)
 	}
-	log.Printf("Making request to URL: %s", req.URL.String())
-
-	trace := &httptrace.ClientTrace{
-		ConnectStart: func(network, addr string) {
-			log.Printf("Connect start: network=%s addr=%s", network, addr)
-		},
-		ConnectDone: func(network, addr string, err error) {
-			log.Printf("Connect done: network=%s addr=%s err=%v", network, addr, err)
-		},
-	}
-	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
 
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
 	req.Header.Set("Accept", "application/json")
@@ -146,30 +132,8 @@ func (ms *mavenSearch) tryGetMavenPackage(ctx context.Context, sha1 string) (*pk
 	q.Set("wt", "json")
 	req.URL.RawQuery = q.Encode()
 
-	// Get runtime stats before request
-	var stats runtime.MemStats
-	runtime.ReadMemStats(&stats)
-	preNumGC := stats.NumGC
-
 	resp, err := ms.client.Do(req)
 	log.Printf("Response: status=%s err=%v", resp.Status, err)
-	reqDuration := time.Since(start)
-
-	// Get post-request stats
-	runtime.ReadMemStats(&stats)
-
-	log.Printf("Request timing for %s:", sha1)
-	log.Printf("  Duration: %v", reqDuration)
-	log.Printf("  NumGoroutine: %d", runtime.NumGoroutine())
-	log.Printf("  NumGC: %d (delta: %d)", stats.NumGC, stats.NumGC-preNumGC)
-	log.Printf("  HeapAlloc: %d MB", stats.HeapAlloc/1024/1024)
-
-	if resp != nil {
-		log.Printf("  Remote addr: %v", resp.Request.RemoteAddr)
-		log.Printf("  Protocol: %v", resp.Proto)
-		log.Printf("  Was compressed: %v", resp.Uncompressed)
-		log.Printf("  Connection reused: %v", resp.Request.Close)
-	}
 
 	if err != nil {
 		return nil, fmt.Errorf("sha1 search error: %w", err)
@@ -180,13 +144,6 @@ func (ms *mavenSearch) tryGetMavenPackage(ctx context.Context, sha1 string) (*pk
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("status %s from %s (body: %s)", resp.Status, req.URL.String(), body)
 	}
-	//fmt.Printf("Retry-After: %s\n", resp.Header.Get("Retry-After"))
-	//fmt.Printf("X-RateLimit-Limit: %s\n", resp.Header.Get("X-RateLimit-Limit"))
-	//fmt.Printf("X-RateLimit-Remaining: %s\n", resp.Header.Get("X-RateLimit-Remaining"))
-	//fmt.Printf("X-RateLimit-Reset: %s\n", resp.Header.Get("X-RateLimit-Reset"))
-	//fmt.Printf("RateLimit-Limit: %s\n", resp.Header.Get("RateLimit-Limit"))
-	//fmt.Printf("RateLimit-Remaining: %s\n", resp.Header.Get("RateLimit-Remaining"))
-	//fmt.Printf("RateLimit-Reset: %s\n", resp.Header.Get("RateLimit-Reset"))
 
 	var res mavenAPIResponse
 	if err = json.NewDecoder(resp.Body).Decode(&res); err != nil {

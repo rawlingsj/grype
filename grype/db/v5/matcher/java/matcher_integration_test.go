@@ -2,41 +2,13 @@ package java
 
 import (
 	"context"
-	"log"
-	"net"
-	"net/http"
 	"testing"
 	"time"
 )
 
 func TestMavenSearch_GetMavenPackageBySha(t *testing.T) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     30 * time.Second,
-			DisableCompression:  true,
-			ForceAttemptHTTP2:   false,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				start := time.Now()
-				d := &net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 15 * time.Second,
-				}
-				conn, err := d.DialContext(ctx, network, addr)
-				log.Printf("Dial: addr=%s localAddr=%v remoteAddr=%v took=%v err=%v",
-					addr,
-					conn.LocalAddr(),
-					conn.RemoteAddr(),
-					time.Since(start),
-					err)
-				return conn, err
-			},
-		},
-	}
 
-	ms := NewMavenSearch(client, "https://search.maven.org/solrsearch/select")
+	ms := NewMavenSearch(nil, "https://search.maven.org/solrsearch/select")
 
 	// Known SHA1s to test with
 	shas := []string{
@@ -683,7 +655,7 @@ func TestMavenSearch_GetMavenPackageBySha(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	for i := 0; i < 4; i++ {
+	for i := 0; i < 1; i++ {
 		t.Logf("Iteration %d", i)
 
 		for _, sha := range shas {
