@@ -1,26 +1,49 @@
 package java
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"net/http/httptrace"
+	"runtime"
 	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/anchore/grype/grype/pkg"
 	syftPkg "github.com/anchore/syft/syft/pkg"
+	"golang.org/x/time/rate"
 )
 
-// MavenSearcher is the interface that wraps the GetMavenPackageBySha method.
 type MavenSearcher interface {
-	// GetMavenPackageBySha provides an interface for building a package from maven data based on a sha1 digest
-	GetMavenPackageBySha(string) (*pkg.Package, error)
+	GetMavenPackageBySha(context.Context, string) (*pkg.Package, error)
 }
 
-// mavenSearch implements the MavenSearcher interface
 type mavenSearch struct {
-	client  *http.Client
-	baseURL string
+	client     *http.Client
+	baseURL    string
+	limiter    *rate.Limiter
+	mu         sync.RWMutex
+	lastError  time.Time
+	errorCount int
+}
+
+func NewMavenSearch(client *http.Client, baseURL string) *mavenSearch {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	return &mavenSearch{
+		client:  client,
+		baseURL: baseURL,
+
+		// 200 fails after 4.5 mins
+		limiter: rate.NewLimiter(rate.Every(300*time.Millisecond), 1),
+	}
 }
 
 type mavenAPIResponse struct {
@@ -37,27 +60,133 @@ type mavenAPIResponse struct {
 	} `json:"response"`
 }
 
-func (ms *mavenSearch) GetMavenPackageBySha(sha1 string) (*pkg.Package, error) {
-	req, err := http.NewRequest(http.MethodGet, ms.baseURL, nil)
+func (ms *mavenSearch) adjustRateLimit() {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+
+	if time.Since(ms.lastError) > 5*time.Minute {
+		ms.errorCount = 0
+		ms.limiter.SetLimit(rate.Every(1 * time.Second))
+		return
+	}
+
+	newDelay := time.Duration(ms.errorCount+1) * 2 * time.Second
+	ms.limiter.SetLimit(rate.Every(newDelay))
+}
+
+func (ms *mavenSearch) recordError() {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.lastError = time.Now()
+	ms.errorCount++
+}
+
+func (ms *mavenSearch) GetMavenPackageBySha(ctx context.Context, sha1 string) (*pkg.Package, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	maxRetries := 5
+	baseDelay := 500 * time.Millisecond
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		if err := ms.limiter.Wait(ctx); err != nil {
+			return nil, fmt.Errorf("rate limiter error: %w", err)
+		}
+
+		pkg, err := ms.tryGetMavenPackage(ctx, sha1)
+		if err == nil {
+			return pkg, nil
+		}
+
+		if strings.Contains(err.Error(), "status 403") {
+			delay := baseDelay * time.Duration(attempt+1) // Linear instead of exponential
+			time.Sleep(delay)
+			continue
+		}
+
+		return nil, err
+	}
+	return nil, fmt.Errorf("max retries exceeded for sha1: %s", sha1)
+}
+
+func (ms *mavenSearch) tryGetMavenPackage(ctx context.Context, sha1 string) (*pkg.Package, error) {
+	start := time.Now()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ms.baseURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to initialize HTTP client: %w", err)
 	}
+	log.Printf("Making request to URL: %s", req.URL.String())
+
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(network, addr string) {
+			log.Printf("Connect start: network=%s addr=%s", network, addr)
+		},
+		ConnectDone: func(network, addr string, err error) {
+			log.Printf("Connect done: network=%s addr=%s err=%v", network, addr, err)
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(ctx, trace))
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Connection", "keep-alive")
 
 	q := req.URL.Query()
-	q.Set("q", fmt.Sprintf(sha1Query, sha1))
+	q.Set("q", fmt.Sprintf("1:\"%s\"", sha1))
+	q.Set("core", "gav")
 	q.Set("rows", "1")
 	q.Set("wt", "json")
 	req.URL.RawQuery = q.Encode()
 
+	// Get runtime stats before request
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	preNumGC := stats.NumGC
+
 	resp, err := ms.client.Do(req)
+	log.Printf("Response: status=%s err=%v", resp.Status, err)
+	reqDuration := time.Since(start)
+
+	// Get post-request stats
+	runtime.ReadMemStats(&stats)
+
+	log.Printf("Request timing for %s:", sha1)
+	log.Printf("  Duration: %v", reqDuration)
+	log.Printf("  NumGoroutine: %d", runtime.NumGoroutine())
+	log.Printf("  NumGC: %d (delta: %d)", stats.NumGC, stats.NumGC-preNumGC)
+	log.Printf("  HeapAlloc: %d MB", stats.HeapAlloc/1024/1024)
+
+	if resp != nil {
+		log.Printf("  Remote addr: %v", resp.Request.RemoteAddr)
+		log.Printf("  Protocol: %v", resp.Proto)
+		log.Printf("  Was compressed: %v", resp.Uncompressed)
+		log.Printf("  Connection reused: %v", resp.Request.Close)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("sha1 search error: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %s from %s", resp.Status, req.URL.String())
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %s from %s (body: %s)", resp.Status, req.URL.String(), body)
 	}
+	//fmt.Printf("Retry-After: %s\n", resp.Header.Get("Retry-After"))
+	//fmt.Printf("X-RateLimit-Limit: %s\n", resp.Header.Get("X-RateLimit-Limit"))
+	//fmt.Printf("X-RateLimit-Remaining: %s\n", resp.Header.Get("X-RateLimit-Remaining"))
+	//fmt.Printf("X-RateLimit-Reset: %s\n", resp.Header.Get("X-RateLimit-Reset"))
+	//fmt.Printf("RateLimit-Limit: %s\n", resp.Header.Get("RateLimit-Limit"))
+	//fmt.Printf("RateLimit-Remaining: %s\n", resp.Header.Get("RateLimit-Remaining"))
+	//fmt.Printf("RateLimit-Reset: %s\n", resp.Header.Get("RateLimit-Reset"))
 
 	var res mavenAPIResponse
 	if err = json.NewDecoder(resp.Body).Decode(&res); err != nil {
@@ -68,8 +197,6 @@ func (ms *mavenSearch) GetMavenPackageBySha(sha1 string) (*pkg.Package, error) {
 		return nil, fmt.Errorf("digest %s: %w", sha1, errors.New("no artifact found"))
 	}
 
-	// artifacts might have the same SHA-1 digests.
-	// e.g. "javax.servlet:jstl" and "jstl:jstl"
 	docs := res.Response.Docs
 	sort.Slice(docs, func(i, j int) bool {
 		return docs[i].ID < docs[j].ID
